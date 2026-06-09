@@ -1,0 +1,16 @@
+[
+  {
+    "id": "personal",
+    "name": "Personal",
+    "email": "you@gmail.com",
+    "credentialsFile": "credentials.json",
+    "tokenFile": "token-personal.json"
+  },
+  {
+    "id": "work",
+    "name": "Work",
+    "email": "you@yourcompany.com",
+    "credentialsFile": "credentials.json",
+    "tokenFile": "token-work.json"
+  }
+]

@@ -1,0 +1,20 @@
+# OAuth credentials — download from Google Cloud Console
+credentials.json
+personal-credentials.json
+client_secret_*.json
+
+# OAuth tokens — generated automatically on first run
+token-*.json
+
+# Runtime data
+accounts.json
+learning.json
+
+# Claude Code local settings
+.claude/
+
+# Dependencies
+node_modules/
+
+# Logs
+*.log
