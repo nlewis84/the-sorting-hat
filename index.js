@@ -18,8 +18,8 @@ const FILTER_THRESHOLD = 3;
 const BATCH_SIZE = 15;
 const LOOKAHEAD = 2;
 
-const OLLAMA_URL = 'http://localhost:11434/api/chat';
-const QWEN_MODEL = 'qwen2.5-coder:14b';
+const OLLAMA_URL = 'http://127.0.0.1:11434/api/chat';
+const QWEN_MODEL = 'qwen2.5-coder:1.5b';
 
 // ─── Colors ────────────────────────────────────────────────────────────────
 

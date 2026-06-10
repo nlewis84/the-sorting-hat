@@ -17,7 +17,7 @@ No data leaves your machine. The LLM runs locally via Ollama.
 ## Requirements
 
 - [Node.js](https://nodejs.org) v18+
-- [Ollama](https://ollama.com) running locally with `qwen2.5-coder:14b` pulled
+- [Ollama](https://ollama.com) running locally with `qwen2.5-coder:1.5b` pulled
 - A Google Cloud project with the Gmail API enabled
 
 ---
@@ -35,7 +35,7 @@ npm install
 ### 2. Pull the model
 
 ```bash
-ollama pull qwen2.5-coder:14b
+ollama pull qwen2.5-coder:1.5b
 ```
 
 ### 3. Google credentials
@@ -74,6 +74,14 @@ alias email='node /path/to/the-sorting-hat/index.js'
 ---
 
 ## Usage
+
+Make sure Ollama is running first:
+
+```bash
+ollama serve
+```
+
+Then in a separate terminal (or if Ollama is already running as a background service):
 
 ```bash
 email
