@@ -13,7 +13,8 @@ const SCOPES = [
 const CREDENTIALS_PATH = path.join(process.cwd(), 'credentials.json');
 const ACCOUNTS_PATH = path.join(process.cwd(), 'accounts.json');
 const LEARNING_PATH = path.join(process.cwd(), 'learning.json');
-const PORT = 3000;
+const PORT_START = 3000;
+const PORT_TRIES = 20;
 const FILTER_THRESHOLD = 3;
 const BATCH_SIZE = 15;
 const LOOKAHEAD = 2;
@@ -114,10 +115,33 @@ async function selectAccounts(accounts) {
   return [map.get(answer) ?? accounts[0]];
 }
 
+// Bind to the first free port at or after PORT_START instead of dying on EADDRINUSE.
+function listenOnFreePort(server, startPort = PORT_START, tries = PORT_TRIES) {
+  return new Promise((resolve, reject) => {
+    let port = startPort;
+    const lastPort = startPort + tries - 1;
+    const onError = (err) => {
+      if (err.code !== 'EADDRINUSE' || port >= lastPort) {
+        server.removeListener('error', onError);
+        reject(err.code === 'EADDRINUSE' ? new Error(`No free port found in ${startPort}-${lastPort}.`) : err);
+        return;
+      }
+      port += 1;
+      server.listen(port);
+    };
+    server.on('error', onError);
+    server.once('listening', () => {
+      server.removeListener('error', onError);
+      resolve(port);
+    });
+    server.listen(port);
+  });
+}
+
 async function authorize(account) {
   const keys = await loadKeys(account.credentialsFile);
   const tokenPath = path.join(process.cwd(), account.tokenFile);
-  const client = new google.auth.OAuth2(keys.client_id, keys.client_secret, `http://localhost:${PORT}`);
+  const client = new google.auth.OAuth2(keys.client_id, keys.client_secret);
 
   try {
     client.setCredentials(JSON.parse(await fs.readFile(tokenPath, 'utf8')));
@@ -126,25 +150,29 @@ async function authorize(account) {
   } catch { /* need new auth */ }
 
   console.log(`\nAuthorizing ${account.name} (${account.email})...`);
+  const server = http.createServer();
+  const port = await listenOnFreePort(server);
+  const redirectUri = `http://localhost:${port}`;
+  if (port !== PORT_START) console.log(clr.dim(`  Port ${PORT_START} in use — listening on ${port} instead.`));
+
   return new Promise((resolve, reject) => {
-    const server = http.createServer(async (req, res) => {
+    server.on('error', reject);
+    server.on('request', async (req, res) => {
       try {
-        const code = new URL(req.url, `http://localhost:${PORT}`).searchParams.get('code');
+        const code = new URL(req.url, redirectUri).searchParams.get('code');
         if (!code) { res.end('Missing code.'); return; }
         res.writeHead(200, { 'Content-Type': 'text/html' });
         res.end('<h2>Authorization successful! You can close this tab.</h2>');
         server.close();
-        const { tokens } = await client.getToken(code);
+        const { tokens } = await client.getToken({ code, redirect_uri: redirectUri });
         client.setCredentials(tokens);
         await fs.writeFile(tokenPath, JSON.stringify(tokens, null, 2));
         console.log(`Token saved for ${account.name}.\n`);
         resolve(client);
       } catch (err) { server.close(); reject(err); }
     });
-    server.listen(PORT, () => {
-      const url = client.generateAuthUrl({ access_type: 'offline', scope: SCOPES, prompt: 'consent', login_hint: account.email });
-      exec(`start "" "${url}"`);
-    });
+    const url = client.generateAuthUrl({ access_type: 'offline', scope: SCOPES, prompt: 'consent', login_hint: account.email, redirect_uri: redirectUri });
+    exec(`start "" "${url}"`);
   });
 }
 
