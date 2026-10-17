@@ -20,7 +20,7 @@ const BATCH_SIZE = 15;
 const LOOKAHEAD = 2;
 
 const OLLAMA_URL = 'http://127.0.0.1:11434/api/chat';
-const QWEN_MODEL = 'qwen2.5-coder:1.5b';
+const QWEN_MODEL = process.env.QWEN_MODEL || 'qwen2.5-coder:14b';
 
 // ─── Colors ────────────────────────────────────────────────────────────────
 
@@ -237,6 +237,7 @@ async function recordAndMaybeFilter(gmail, accountId, emails, learning) {
   ensureAccount(learning, accountId);
   const senders = learning[accountId].neutral;
   for (const email of emails) {
+    if (isProtectedJobSender(email)) continue;
     const sender = extractEmail(email.from);
     if (!senders[sender]) senders[sender] = { count: 0, filterId: null };
     senders[sender].count++;
@@ -277,6 +278,7 @@ async function recordAndMaybeFilterSpam(gmail, accountId, emails, learning) {
   ensureAccount(learning, accountId);
   const senders = learning[accountId].spam;
   for (const email of emails) {
+    if (isProtectedJobSender(email)) continue;
     const sender = extractEmail(email.from);
     if (!senders[sender]) senders[sender] = { count: 0, filterId: null };
     senders[sender].count++;
@@ -293,6 +295,35 @@ async function recordAndMaybeFilterSpam(gmail, accountId, emails, learning) {
       }
     }
   }
+}
+
+// ─── Job-search guard ──────────────────────────────────────────────────────
+// Job application emails must never be missed: they skip the LLM (always important)
+// and their senders never get auto-created read/spam filters.
+
+// Applicant-tracking systems that send candidate mail (confirmations, interviews, decisions).
+const ATS_DOMAIN = /(^|\.)(greenhouse-mail\.io|greenhouse\.io|lever\.co|ashbyhq\.com|myworkday\.com|myworkdayjobs\.com|icims\.com|smartrecruiters\.com|jobvite\.com|taleo\.net|successfactors\.(com|eu)|workablemail\.com|workable\.com|bamboohr\.com|breezy\.hr|applytojob\.com|recruitee\.com|teamtailor\.com|dover\.com)$/i;
+// Job boards: not always important, but never auto-filtered (recruiter messages and application notices come from here).
+const JOB_BOARD_DOMAIN = /(^|\.)(linkedin\.com|indeed\.com|ziprecruiter\.com|glassdoor\.com|wellfound\.com|dice\.com|hired\.com|theladders\.com)$/i;
+
+// Bare "your application" is too broad: dev tools say it about software ("latency across your application").
+const APPLICATION = 'your application (for|to|with|at|status|update|has been (received|reviewed|submitted)|was (received|reviewed|submitted|sent|viewed))|(received|reviewing) your application|regarding your application|thank(s| you) for (applying|your application)|application (received|status|update)|your candidacy';
+const JOB_PHRASE = new RegExp(`\\b(${APPLICATION}|interview|other candidates|offer letter|recruiter|hiring (manager|team))\\b`, 'i');
+// Unambiguous enough to trust in the preview text, not just the subject.
+const JOB_PHRASE_STRONG = new RegExp(`\\b(${APPLICATION}|schedul(e|ing) (an|your) interview)\\b`, 'i');
+const JOB_DIGEST = /\b(jobs? (you may|for you|alerts?|similar)|new jobs|recommended jobs|dream job|top job picks|is hiring|are hiring)\b/i;
+
+const senderDomain = from => extractEmail(from).split('@')[1] ?? '';
+
+function isJobEmail(e) {
+  if (ATS_DOMAIN.test(senderDomain(e.from))) return true;
+  if (JOB_DIGEST.test(e.subject)) return false;
+  return JOB_PHRASE.test(e.subject) || JOB_PHRASE_STRONG.test(e.snippet ?? '');
+}
+
+function isProtectedJobSender(e) {
+  const domain = senderDomain(e.from);
+  return isJobEmail(e) || ATS_DOMAIN.test(domain) || JOB_BOARD_DOMAIN.test(domain);
 }
 
 // ─── LLM ───────────────────────────────────────────────────────────────────
@@ -319,7 +350,7 @@ Use "neutral" for: mortgage/financial statements, HOA meeting notices, investmen
 
 Use "junk" for: promotional offers, discount codes, sales emails, pre-selected credit card offers, cruise/travel upsells, unsolicited marketing, bulk advertising.
 
-NEVER mark as important: financial offers ("pre-selected", "you've been chosen", "earn more"), credit card applications, promotional reminders from banks or retailers, routine monthly statements, or any email from a no-reply address unless it is a security alert or confirmed booking.
+NEVER mark as important: financial offers ("pre-selected", "you've been chosen", "earn more"), credit card applications, promotional reminders from banks or retailers, routine monthly statements, or any email from a no-reply address unless it is a security alert, confirmed booking, or an update about a job application.
 
 When in doubt between "important" and "neutral", choose "neutral". Return valid JSON only, no explanation.`;
 
@@ -373,7 +404,8 @@ async function writeDebugLog(label, raw, parsed, items) {
 }
 
 async function analyzeWithQwen(emails) {
-  const toAnalyze = emails.filter(e => !e.labelIds.includes('STARRED') && !e.labelIds.includes('IMPORTANT'));
+  const jobIds = new Set(emails.filter(isJobEmail).map(e => e.id));
+  const toAnalyze = emails.filter(e => !jobIds.has(e.id) && !e.labelIds.includes('STARRED') && !e.labelIds.includes('IMPORTANT'));
   const preImportant = new Set(emails.filter(e => e.labelIds.includes('STARRED') || e.labelIds.includes('IMPORTANT')).map(e => e.id));
 
   const merge = (llmItems, parseWarning) => {
@@ -386,6 +418,7 @@ async function analyzeWithQwen(emails) {
     }
     return {
       emails: emails.map((e, i) => {
+        if (jobIds.has(e.id)) return { index: i + 1, category: 'important', reason: 'job application' };
         if (preImportant.has(e.id)) return { index: i + 1, category: 'important', reason: 'already starred in Gmail' };
         const r = llmById.get(e.id) ?? { category: 'neutral', reason: '' };
         return { index: i + 1, ...r };
@@ -736,4 +769,8 @@ async function main() {
   console.log(`\n  ${clr.ok('✓')} All done\n`);
 }
 
-main().catch(console.error).finally(() => process.exit(0));
+if (require.main === module) {
+  main().catch(console.error).finally(() => process.exit(0));
+}
+
+module.exports = { authorize, loadAccounts, loadLearning, analyzeWithQwen, isJobEmail, isProtectedJobSender, QWEN_MODEL };
