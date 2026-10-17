@@ -17,7 +17,7 @@ No data leaves your machine. The LLM runs locally via Ollama.
 ## Requirements
 
 - [Node.js](https://nodejs.org) v18+
-- [Ollama](https://ollama.com) running locally with `qwen2.5-coder:1.5b` pulled
+- [Ollama](https://ollama.com) running locally with `qwen2.5-coder:14b` pulled (~9 GB; a GPU with 12 GB+ VRAM keeps it fast)
 - A Google Cloud project with the Gmail API enabled
 
 ---
@@ -35,7 +35,14 @@ npm install
 ### 2. Pull the model
 
 ```bash
+ollama pull qwen2.5-coder:14b
+```
+
+On a smaller machine, use the lighter (less accurate) model instead by setting `QWEN_MODEL`:
+
+```bash
 ollama pull qwen2.5-coder:1.5b
+QWEN_MODEL=qwen2.5-coder:1.5b node index.js
 ```
 
 ### 3. Google credentials
