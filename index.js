@@ -3,7 +3,8 @@ const http = require('http');
 const fs = require('fs').promises;
 const path = require('path');
 const { exec } = require('child_process');
-const { Select, MultiSelect, Confirm } = require('enquirer');
+const { Select } = require('enquirer');
+const tui = require('./tui');
 
 const SCOPES = [
   'https://www.googleapis.com/auth/gmail.readonly',
@@ -31,9 +32,6 @@ const A = {
 };
 const R = A.reset;
 const clr = {
-  imp:  s => `${A.bold}${A.bYellow}${s}${R}`,
-  neu:  s => `${A.cyan}${s}${R}`,
-  jnk:  s => `${A.dim}${A.red}${s}${R}`,
   ok:   s => `${A.bGreen}${s}${R}`,
   warn: s => `${A.yellow}${s}${R}`,
   err:  s => `${A.red}${s}${R}`,
@@ -41,7 +39,6 @@ const clr = {
   bold: s => `${A.bold}${s}${R}`,
   sep:  s => `${A.dim}${A.cyan}${s}${R}`,
 };
-const trunc = (s, n) => s && s.length > n ? s.slice(0, n - 1) + '…' : (s || '');
 
 // ─── UI helpers ────────────────────────────────────────────────────────────
 
@@ -172,9 +169,18 @@ async function authorize(account) {
       } catch (err) { server.close(); reject(err); }
     });
     const url = client.generateAuthUrl({ access_type: 'offline', scope: SCOPES, prompt: 'consent', login_hint: account.email, redirect_uri: redirectUri });
-    exec(`start "" "${url}"`);
+    openUrl(url);
   });
 }
+
+function openUrl(url) {
+  const cmd = process.platform === 'win32' ? `start "" "${url}"`
+    : process.platform === 'darwin' ? `open "${url}"`
+    : `xdg-open "${url}"`;
+  exec(cmd, () => {});
+}
+
+const gmailLink = (account, id) => `https://mail.google.com/mail/?authuser=${encodeURIComponent(account.email)}#all/${id}`;
 
 // ─── Gmail API ─────────────────────────────────────────────────────────────
 
@@ -203,20 +209,22 @@ async function markAsRead(gmail, id) {
   await gmail.users.messages.modify({ userId: 'me', id, requestBody: { removeLabelIds: ['UNREAD'] } });
 }
 
-async function markAsSpam(gmail, id) {
-  await gmail.users.messages.modify({ userId: 'me', id, requestBody: { addLabelIds: ['SPAM'], removeLabelIds: ['INBOX'] } });
+async function withRetry(fn) {
+  for (let attempt = 0; ; attempt++) {
+    try { return await fn(); }
+    catch (err) {
+      if (err.status === 429 && attempt < 5) await new Promise(r => setTimeout(r, 300 * Math.pow(2, attempt)));
+      else throw err;
+    }
+  }
 }
 
-async function starAndMarkImportant(gmail, id) {
-  await gmail.users.messages.modify({ userId: 'me', id, requestBody: { addLabelIds: ['STARRED', 'IMPORTANT'] } });
-}
-
-async function createReadFilter(gmail, senderEmail) {
-  const res = await gmail.users.settings.filters.create({
-    userId: 'me',
-    requestBody: { criteria: { from: senderEmail }, action: { removeLabelIds: ['UNREAD'] } },
-  });
-  return res.data.id;
+// One request per label change for the whole batch instead of one per email.
+async function batchModify(gmail, ids, { add = [], remove = [] }) {
+  for (let i = 0; i < ids.length; i += 1000) {
+    const chunk = ids.slice(i, i + 1000);
+    await withRetry(() => gmail.users.messages.batchModify({ userId: 'me', requestBody: { ids: chunk, addLabelIds: add, removeLabelIds: remove } }));
+  }
 }
 
 function ensureAccount(learning, accountId) {
@@ -233,68 +241,89 @@ function ensureAccount(learning, accountId) {
   if (!learning[accountId].spam) learning[accountId].spam = {};
 }
 
-async function recordAndMaybeFilter(gmail, accountId, emails, learning) {
+const FILTER_ACTIONS = {
+  neutral: { removeLabelIds: ['UNREAD'] },
+  important: { addLabelIds: ['IMPORTANT'] },
+  spam: { addLabelIds: ['SPAM'], removeLabelIds: ['INBOX'] },
+};
+
+// Count one decision for a sender. When `allowFilter` is set and the count reaches the threshold,
+// create the Gmail filter for that bucket. Returns what changed so the batch can be undone.
+async function recordSender(gmail, learning, accountId, kind, sender, allowFilter) {
   ensureAccount(learning, accountId);
-  const senders = learning[accountId].neutral;
-  for (const email of emails) {
-    if (isProtectedJobSender(email)) continue;
-    const sender = extractEmail(email.from);
-    if (!senders[sender]) senders[sender] = { count: 0, filterId: null };
-    senders[sender].count++;
-    if (senders[sender].count >= FILTER_THRESHOLD && !senders[sender].filterId) {
-      try {
-        senders[sender].filterId = await createReadFilter(gmail, sender);
-        console.log(`    ${clr.warn('⚡')} Filter created for ${A.dim}${sender}${R} — future emails marked read`);
-      } catch (err) {
-        console.log(`    ${clr.err('!')} Could not create filter for ${sender}: ${err.message}`);
-      }
+  const senders = learning[accountId][kind];
+  const rec = senders[sender] ?? (senders[sender] = { count: 0, filterId: null });
+  rec.count++;
+  const entry = { kind, sender, filterId: null };
+  if (allowFilter && rec.count >= FILTER_THRESHOLD && !rec.filterId) {
+    try {
+      const res = await withRetry(() => gmail.users.settings.filters.create({
+        userId: 'me', requestBody: { criteria: { from: sender }, action: FILTER_ACTIONS[kind] },
+      }));
+      rec.filterId = entry.filterId = res.data.id;
+    } catch (err) {
+      entry.error = err.message;
     }
   }
+  return entry;
 }
 
-async function recordAndMaybeFilterImportant(gmail, accountId, emails, learning) {
-  ensureAccount(learning, accountId);
-  const senders = learning[accountId].important;
-  for (const email of emails) {
-    const sender = extractEmail(email.from);
-    if (!senders[sender]) senders[sender] = { count: 0, filterId: null };
-    senders[sender].count++;
-    if (senders[sender].count >= FILTER_THRESHOLD && !senders[sender].filterId) {
-      try {
-        const res = await gmail.users.settings.filters.create({
-          userId: 'me',
-          requestBody: { criteria: { from: sender }, action: { addLabelIds: ['IMPORTANT'] } },
-        });
-        senders[sender].filterId = res.data.id;
-        console.log(`    ${clr.warn('⚡')} Filter created for ${A.dim}${sender}${R} — future emails marked important`);
-      } catch (err) {
-        console.log(`    ${clr.err('!')} Could not create important filter for ${sender}: ${err.message}`);
-      }
-    }
+// Apply a reviewed batch: label changes first, then learning (one record per email, based on
+// where it finally landed). Returns a record that revertBatch can undo.
+async function applyBatch(gmail, account, view, learning, skipFilters) {
+  const p = tui.plan(view.items);
+  const ids = list => list.map(e => e.id);
+  await batchModify(gmail, ids(p.star), { add: ['STARRED', 'IMPORTANT'] });
+  await batchModify(gmail, ids(p.read), { remove: ['UNREAD'] });
+  await batchModify(gmail, ids(p.spam), { add: ['SPAM'], remove: ['INBOX'] });
+
+  const learned = [];
+  for (const e of view.items) {
+    const kind = tui.learnKind(e);
+    if (kind) learned.push(await recordSender(gmail, learning, account.id, kind, e.addr, !skipFilters && tui.willFilter(e)));
   }
+  await saveLearning(learning);
+
+  return {
+    view, skipFilters, learned,
+    star: ids(p.star), read: ids(p.read), spam: ids(p.spam),
+    counts: {
+      star: p.star.length, read: p.read.length, spam: p.spam.length,
+      filters: learned.filter(l => l.filterId).length,
+      moved: p.moved.length,
+      unread: view.items.filter(e => !tui.effRead(e) && !p.spam.includes(e)).length,
+    },
+    failures: learned.filter(l => l.error),
+  };
 }
 
-async function recordAndMaybeFilterSpam(gmail, accountId, emails, learning) {
-  ensureAccount(learning, accountId);
-  const senders = learning[accountId].spam;
-  for (const email of emails) {
-    if (isProtectedJobSender(email)) continue;
-    const sender = extractEmail(email.from);
-    if (!senders[sender]) senders[sender] = { count: 0, filterId: null };
-    senders[sender].count++;
-    if (senders[sender].count >= FILTER_THRESHOLD && !senders[sender].filterId) {
-      try {
-        const res = await gmail.users.settings.filters.create({
-          userId: 'me',
-          requestBody: { criteria: { from: sender }, action: { addLabelIds: ['SPAM'], removeLabelIds: ['INBOX'] } },
-        });
-        senders[sender].filterId = res.data.id;
-        console.log(`    ${clr.warn('⚡')} Filter created for ${A.dim}${sender}${R} — future emails go to spam`);
-      } catch (err) {
-        console.log(`    ${clr.err('!')} Could not create spam filter for ${sender}: ${err.message}`);
-      }
-    }
+async function revertBatch(gmail, account, rec, learning) {
+  // Only remove the labels this batch added; Gmail may have marked some of them IMPORTANT already.
+  const byId = new Map(rec.view.items.map(e => [e.id, e]));
+  const groups = new Map();
+  for (const id of rec.star) {
+    const remove = ['STARRED', 'IMPORTANT'].filter(l => !byId.get(id).labelIds.includes(l));
+    const key = remove.join(',');
+    if (!groups.has(key)) groups.set(key, { remove, ids: [] });
+    groups.get(key).ids.push(id);
   }
+  for (const g of groups.values()) if (g.remove.length) await batchModify(gmail, g.ids, { remove: g.remove });
+  await batchModify(gmail, rec.read, { add: ['UNREAD'] });
+  await batchModify(gmail, rec.spam, { add: ['INBOX'], remove: ['SPAM'] });
+
+  ensureAccount(learning, account.id);
+  for (const l of rec.learned) {
+    const senders = learning[account.id][l.kind];
+    const s = senders[l.sender];
+    if (!s) continue;
+    if (l.filterId) {
+      await withRetry(() => gmail.users.settings.filters.delete({ userId: 'me', id: l.filterId }));
+      s.filterId = null;
+    }
+    s.count = Math.max(0, s.count - 1);
+    if (!s.count && !s.filterId) delete senders[l.sender];
+  }
+  await saveLearning(learning);
 }
 
 // ─── Job-search guard ──────────────────────────────────────────────────────
@@ -495,189 +524,148 @@ async function* batchPipeline(gmail, allRefs, bgState) {
   }
 }
 
-// ─── Display & interaction per batch ───────────────────────────────────────
+// ─── Batch review ──────────────────────────────────────────────────────────
 
-function renderHeader(account, batchNum, totalBatches, bgState, parseWarning) {
-  console.clear();
-  const hr = clr.sep('━'.repeat(60));
-  console.log(hr);
-  const nums = [...bgState.inFlight].sort((a, b) => a - b);
-  const spinPart = nums.length > 0
-    ? `  ${A.dim}⧗ analyzing ${nums.length === 1 ? nums[0] : `${nums[0]}–${nums[nums.length - 1]}`}${R}`
-    : '';
-  console.log(`  ${A.bold}${account.name}${R}  ${A.dim}·${R}  Batch ${A.cyan}${batchNum}${R}${A.dim}/${totalBatches}${R}${spinPart}`);
-  if (parseWarning) console.log(`  ${clr.warn('! LLM parse failed — see llm-debug.log')}`);
-  console.log(hr);
+const PARSE_WARNING = "The model's reply couldn't be parsed, so this batch defaulted to neutral. Details in llm-debug.log.";
+const HOUSES = ['important', 'neutral', 'junk'];
+
+// Turn a fetched, classified batch into review items: the hat's pick, the sender's learning
+// history (so the screen can show how close each sender is to an auto-filter), and job protection.
+function toItems(batch, learning, accountId) {
+  ensureAccount(learning, accountId);
+  const acc = learning[accountId];
+  return batch.result.emails.map(r => {
+    const e = batch.emails[r.index - 1];
+    if (!e) return null;
+    const house = HOUSES.includes(r.category) ? r.category : 'neutral';
+    const addr = extractEmail(e.from);
+    const learn = {};
+    for (const kind of ['important', 'neutral', 'spam']) {
+      const rec = acc[kind][addr];
+      learn[kind] = { count: rec?.count ?? 0, filtered: !!rec?.filterId };
+    }
+    const guard = isJobEmail(e) ? 'job' : JOB_BOARD_DOMAIN.test(senderDomain(e.from)) ? 'board' : null;
+    return {
+      ...e,
+      addr,
+      name: e.from.replace(/<[^>]*>/g, '').replace(/"/g, '').trim() || addr,
+      house, orig: house, reason: r.reason ?? '',
+      read: house === 'neutral', skip: {}, guard, learn,
+    };
+  }).filter(Boolean);
 }
 
-function startHeaderSpinner(account, batchNum, totalBatches, bgState) {
-  const frames = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
-  let fi = 0;
-  const timer = setInterval(() => {
-    const nums = [...bgState.inFlight].sort((a, b) => a - b);
-    if (nums.length === 0) return;
-    const range = nums.length === 1 ? `${nums[0]}` : `${nums[0]}–${nums[nums.length - 1]}`;
-    const line = `  ${A.bold}${account.name}${R}  ${A.dim}·${R}  Batch ${A.cyan}${batchNum}${R}${A.dim}/${totalBatches}${R}  ${A.dim}${frames[++fi % frames.length]} analyzing ${range}${R}`;
-    process.stdout.write('\x1B7');
-    process.stdout.write('\x1B[2;1H');
-    process.stdout.write(line + ' '.repeat(10));
-    process.stdout.write('\x1B8');
-  }, 80);
-  return () => clearInterval(timer);
+function applyMessage(rec) {
+  const c = rec.counts;
+  let msg = `Batch ${rec.view.batchNum} applied: ${c.star} starred, ${c.read} read, ${c.spam} to spam`;
+  if (c.filters) msg += `, ▽ ${c.filters} new filter${c.filters > 1 ? 's' : ''}`;
+  if (rec.skipFilters && tui.plan(rec.view.items).filters.length) msg += ', filters skipped';
+  if (rec.failures.length) msg += `. Couldn't create a filter for ${rec.failures.map(f => f.sender).join(', ')}`;
+  return `${msg}. Q to undo.`;
 }
 
-async function handleBatch(gmail, batch, batchNum, totalBatches, account, learning, bgState) {
-  const { emails, result } = batch;
-  const by = { important: [], neutral: [], junk: [] };
-
-  for (const item of result.emails) {
-    const email = emails[item.index - 1];
-    if (!email) continue;
-    const cat = item.category in by ? item.category : 'neutral';
-    by[cat].push({ ...email, reason: item.reason });
-  }
-
-  const hdr = () => renderHeader(account, batchNum, totalBatches, bgState, result.parseWarning);
-
-  const showImportant = () => {
-    if (by.important.length === 0) return;
-    console.log(`\n  ${clr.imp('★ IMPORTANT')}  ${clr.dim(`(${by.important.length})`)}`);
-    console.log(`  ${clr.sep('─'.repeat(56))}`);
-    by.important.forEach((e, i) => {
-      const subj = trunc(e.subject, 52);
-      const from = trunc(e.from.replace(/<[^>]*>/g, '').trim(), 40);
-      console.log(`    ${clr.dim(`[${i + 1}]`)} ${A.bold}${subj}${R}`);
-      console.log(`        ${clr.dim(from)}${e.reason ? `  ${clr.dim('·')}  ${clr.dim(e.reason)}` : ''}`);
-    });
-  };
-
-  const showNeutral = () => {
-    if (by.neutral.length === 0) return;
-    console.log(`\n  ${clr.neu('· NEUTRAL')}  ${clr.dim(`(${by.neutral.length})`)}`);
-    console.log(`  ${clr.sep('─'.repeat(56))}`);
-    by.neutral.forEach((e, i) => {
-      const subj = trunc(e.subject, 40);
-      const from = trunc(e.from.replace(/<[^>]*>/g, '').trim(), 25);
-      console.log(`    ${clr.dim(`[${i + 1}]`)} ${subj}  ${clr.dim(from)}`);
-    });
-  };
-
-  const showJunk = () => {
-    if (by.junk.length === 0) return;
-    console.log(`\n  ${clr.jnk('✗ JUNK')}  ${clr.dim(`(${by.junk.length})`)}`);
-    console.log(`  ${clr.sep('─'.repeat(56))}`);
-    by.junk.forEach((e, i) => {
-      const subj = trunc(e.subject, 40);
-      const from = trunc(e.from.replace(/<[^>]*>/g, '').trim(), 25);
-      console.log(`    ${clr.dim(`[${i + 1}] ${subj}  ${from}`)}`);
-    });
-  };
-
-  hdr();
-  showImportant();
-  showNeutral();
-  showJunk();
-  console.log('');
-
-  const emailChoices = list => list.map((e, i) => {
-    const subj = trunc(e.subject, 40);
-    const from = trunc(e.from.replace(/<[^>]*>/g, '').trim(), 25);
-    return `[${i + 1}] ${subj}  ·  ${from}`;
+async function reviewBatches(gmail, account, allRefs, totalBatches) {
+  const learning = await loadLearning();
+  const bgState = { inFlight: new Set() };
+  const pipeline = batchPipeline(gmail, allRefs, bgState);
+  const session = { account, total: allRefs.length, totalBatches, sorted: 0, canUndo: false };
+  const screen = new tui.Screen({
+    bgState, session,
+    onOpen: id => { openUrl(gmailLink(account, id)); screen.toast('ok', 'Opened in Gmail.'); },
   });
-  const choiceIdx = s => { const m = s.match(/^\[(\d+)\]/); return m ? parseInt(m[1]) - 1 : -1; };
+  const applied = [];
+  const redo = []; // views to show again before pulling a new batch (after an undo or a failed apply)
+  let pulled = 0;
+  let quit = false;
 
-  // ── Important: demote any to neutral, star+mark the rest ─────────────────
-  if (by.important.length > 0) {
-    const choices = emailChoices(by.important);
-    let moved = [];
-    const stop = startHeaderSpinner(account, batchNum, totalBatches, bgState);
-    try { moved = await new MultiSelect({ message: 'Move any important → neutral?', choices, hint: '(space to toggle, enter to confirm)' }).run(); } catch {}
-    stop();
-    if (moved.length > 0) {
-      const idx = new Set(moved.map(choiceIdx).filter(i => i >= 0));
-      const demoted = by.important.filter((_, i) => idx.has(i));
-      by.neutral.push(...demoted);
-      by.important = by.important.filter((_, i) => !idx.has(i));
-      await recordAndMaybeFilter(gmail, account.id, demoted, learning);
-      await saveLearning(learning);
+  const syncSession = () => {
+    session.sorted = applied.reduce((n, a) => n + a.view.items.length, 0);
+    session.canUndo = applied.length > 0;
+  };
+
+  async function undoLast() {
+    const last = applied.pop();
+    screen.busy(`Undoing batch ${last.view.batchNum}…`);
+    try {
+      await revertBatch(gmail, account, last, learning);
+    } catch (err) {
+      applied.push(last);
+      screen.toast('err', `Couldn't undo batch ${last.view.batchNum}: ${err.message}`);
+      return;
+    } finally {
+      screen.idle();
     }
-    if (by.important.length > 0) {
-      for (const e of by.important) await starAndMarkImportant(gmail, e.id);
-      console.log(`  ${clr.ok('✓')} Starred ${clr.imp('★')} and marked ${by.important.length} as important`);
-      const readChoices = emailChoices(by.important);
-      let toRead = [];
-      const stopR = startHeaderSpinner(account, batchNum, totalBatches, bgState);
-      try { toRead = await new MultiSelect({ message: 'Mark any important as read?', choices: readChoices, hint: '(space to toggle, enter to confirm)' }).run(); } catch {}
-      stopR();
-      if (toRead.length > 0) {
-        const idx = new Set(toRead.map(choiceIdx).filter(i => i >= 0));
-        for (const e of by.important.filter((_, i) => idx.has(i))) await markAsRead(gmail, e.id);
-        console.log(`  ${clr.ok('✓')} Marked ${toRead.length} important as read`);
-      }
-    }
+    syncSession();
+    const c = last.counts;
+    screen.toast('undo', `Undid batch ${last.view.batchNum}: unstarred ${c.star}, ${c.read} back to unread, ${c.spam} out of spam${c.filters ? `, ${c.filters} filter${c.filters > 1 ? 's' : ''} deleted` : ''}`);
+    last.view.mode = 'list';
+    redo.push(last.view);
   }
 
-  // ── Neutral: promote any to important, mark rest as read ──────────────────
-  if (by.neutral.length > 0) {
-    hdr();
-    showNeutral();
-    console.log('');
-    const nChoices = emailChoices(by.neutral);
-    let promoted = [];
-    const stop2 = startHeaderSpinner(account, batchNum, totalBatches, bgState);
-    try { promoted = await new MultiSelect({ message: 'Move any neutral → important?', choices: nChoices, hint: '(space to toggle, enter to confirm)' }).run(); } catch {}
-    stop2();
-    if (promoted.length > 0) {
-      const idx = new Set(promoted.map(choiceIdx).filter(i => i >= 0));
-      const promoted_emails = by.neutral.filter((_, i) => idx.has(i));
-      by.neutral = by.neutral.filter((_, i) => !idx.has(i));
-      for (const e of promoted_emails) await starAndMarkImportant(gmail, e.id);
-      await recordAndMaybeFilterImportant(gmail, account.id, promoted_emails, learning);
-      await saveLearning(learning);
-      console.log(`  ${clr.ok('✓')} Starred ${clr.imp('★')} and marked ${promoted_emails.length} as important`);
-    }
-    if (by.neutral.length > 0) {
-      let doMark = false;
-      const stop3 = startHeaderSpinner(account, batchNum, totalBatches, bgState);
-      try { doMark = await new Confirm({ message: `Mark ${by.neutral.length} neutral as read?`, initial: true }).run(); } catch {}
-      stop3();
-      if (doMark) {
-        for (const e of by.neutral) await markAsRead(gmail, e.id);
-        await recordAndMaybeFilter(gmail, account.id, by.neutral, learning);
-        await saveLearning(learning);
-        console.log(`  ${clr.ok('✓')} Marked ${by.neutral.length} neutral as read`);
+  const summaryView = () => {
+    const sum = k => applied.reduce((n, a) => n + a.counts[k], 0);
+    return {
+      mode: 'summary', batchNum: pulled, items: [],
+      summary: {
+        emails: session.sorted,
+        star: sum('star'), read: sum('read'), spam: sum('spam'), filters: sum('filters'), moved: sum('moved'), unread: sum('unread'),
+        batches: applied.map(a => ({ num: a.view.batchNum, ...a.counts })).sort((a, b) => a.num - b.num),
+        leftUnsorted: quit ? allRefs.length - session.sorted : 0,
+      },
+    };
+  };
+
+  screen.open();
+  try {
+    for (;;) {
+      let view = redo.pop();
+      if (!view && !quit) {
+        screen.show({ mode: 'loading', batchNum: pulled + 1, items: [] });
+        const next = await pipeline.next();
+        if (!next.done) {
+          pulled++;
+          view = tui.createView({
+            batchNum: pulled,
+            items: toItems(next.value, learning, account.id),
+            warning: next.value.result.parseWarning ? PARSE_WARNING : null,
+          });
+        }
+      }
+
+      if (!view) {
+        const outcome = await screen.wait(summaryView());
+        if (outcome.type === 'undo') { await undoLast(); continue; }
+        break;
+      }
+
+      const outcome = await screen.wait(view);
+      if (outcome.type === 'quit') {
+        quit = true;
+        redo.length = 0;
+      } else if (outcome.type === 'undo') {
+        redo.push(view);
+        await undoLast();
+      } else if (outcome.type === 'apply') {
+        screen.busy(`Applying batch ${view.batchNum} to Gmail…`);
+        try {
+          const rec = await applyBatch(gmail, account, view, learning, outcome.skipFilters);
+          applied.push(rec);
+          syncSession();
+          screen.toast(rec.failures.length ? 'warn' : 'ok', applyMessage(rec));
+        } catch (err) {
+          screen.toast('err', `Couldn't apply batch ${view.batchNum}: ${err.message}`);
+          redo.push(view);
+        } finally {
+          screen.idle();
+        }
       }
     }
+  } finally {
+    screen.close();
   }
 
-  // ── Junk: rescue any (stays unread), spam the rest ────────────────────────
-  if (by.junk.length > 0) {
-    hdr();
-    showJunk();
-    console.log('');
-    const jChoices = emailChoices(by.junk);
-    let rescued = [];
-    const stop4 = startHeaderSpinner(account, batchNum, totalBatches, bgState);
-    try { rescued = await new MultiSelect({ message: 'Rescue any from junk?', choices: jChoices, hint: '(space to toggle, enter to confirm)' }).run(); } catch {}
-    stop4();
-    if (rescued.length > 0) {
-      const idx = new Set(rescued.map(choiceIdx).filter(i => i >= 0));
-      by.junk = by.junk.filter((_, i) => !idx.has(i));
-      console.log(`  ${clr.dim('→')} Rescued ${rescued.length} (left unread in inbox)`);
-    }
-    if (by.junk.length > 0) {
-      let doSpam = false;
-      const stop5 = startHeaderSpinner(account, batchNum, totalBatches, bgState);
-      try { doSpam = await new Confirm({ message: `Move ${by.junk.length} junk to spam?`, initial: true }).run(); } catch {}
-      stop5();
-      if (doSpam) {
-        for (const e of by.junk) await markAsSpam(gmail, e.id);
-        await recordAndMaybeFilterSpam(gmail, account.id, by.junk, learning);
-        await saveLearning(learning);
-        console.log(`  ${clr.ok('✓')} Moved ${by.junk.length} to spam`);
-      }
-    }
-  }
+  const s = summaryView().summary;
+  console.log(`  ${clr.ok('✓')} Sorted ${A.bold}${s.emails}${R} — ${s.star} starred, ${s.read} read, ${s.spam} to spam, ${s.filters} new filter${s.filters === 1 ? '' : 's'}`);
 }
 
 // ─── Main ──────────────────────────────────────────────────────────────────
@@ -689,7 +677,7 @@ async function processAccount(account) {
   console.log(`\n${clr.sep('─'.repeat(60))}`);
   console.log(`  ${A.bold}${account.name}${R}  ${clr.dim(account.email)}`);
 
-  let stopSpin = startSpinner('Loading message list...');
+  const stopSpin = startSpinner('Loading message list...');
   const allRefs = await getAllMessageRefs(gmail);
   stopSpin();
 
@@ -735,24 +723,11 @@ async function processAccount(account) {
     return;
   }
 
-  const learning = await loadLearning();
-  const bgState = { inFlight: new Set() };
-  const pipeline = batchPipeline(gmail, allRefs, bgState);
-
-  let batchNum = 0;
-  let next = pipeline.next();
-
-  for (;;) {
-    stopSpin = startSpinner(`Batch ${batchNum + 1}/${totalBatches} — fetching & analyzing...`);
-    const { value: batch, done } = await next;
-    stopSpin();
-    if (done) break;
-
-    batchNum++;
-    next = pipeline.next();
-
-    await handleBatch(gmail, batch, batchNum, totalBatches, account, learning, bgState);
+  if (!process.stdin.isTTY) {
+    console.log(`  ${clr.err('!')} Batch review needs an interactive terminal.`);
+    return;
   }
+  await reviewBatches(gmail, account, allRefs, totalBatches);
 }
 
 async function main() {
@@ -773,4 +748,4 @@ if (require.main === module) {
   main().catch(console.error).finally(() => process.exit(0));
 }
 
-module.exports = { authorize, loadAccounts, loadLearning, analyzeWithQwen, isJobEmail, isProtectedJobSender, QWEN_MODEL };
+module.exports = { authorize, loadAccounts, loadLearning, analyzeWithQwen, isJobEmail, isProtectedJobSender, toItems, applyBatch, revertBatch, QWEN_MODEL };
