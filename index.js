@@ -3,7 +3,7 @@ const http = require('http');
 const fs = require('fs').promises;
 const path = require('path');
 const { exec } = require('child_process');
-const { Select } = require('enquirer');
+const { existsSync } = require('fs');
 const tui = require('./tui');
 
 const SCOPES = [
@@ -25,57 +25,14 @@ const QWEN_MODEL = process.env.QWEN_MODEL || 'qwen2.5-coder:14b';
 
 // ─── Colors ────────────────────────────────────────────────────────────────
 
-const A = {
-  reset:   '\x1b[0m', bold: '\x1b[1m', dim: '\x1b[2m',
-  red:     '\x1b[31m', green: '\x1b[32m', yellow: '\x1b[33m', cyan: '\x1b[36m',
-  bGreen:  '\x1b[92m', bYellow: '\x1b[93m', bCyan:  '\x1b[96m',
-};
+// Only used for the lines printed after the full-screen UI closes; the UI itself is drawn by tui.js.
+const A = { reset: '\x1b[0m', bold: '\x1b[1m', dim: '\x1b[2m', red: '\x1b[31m', bGreen: '\x1b[92m', bYellow: '\x1b[93m' };
 const R = A.reset;
 const clr = {
-  ok:   s => `${A.bGreen}${s}${R}`,
-  warn: s => `${A.yellow}${s}${R}`,
-  err:  s => `${A.red}${s}${R}`,
-  dim:  s => `${A.dim}${s}${R}`,
-  bold: s => `${A.bold}${s}${R}`,
-  sep:  s => `${A.dim}${A.cyan}${s}${R}`,
+  ok:  s => `${A.bGreen}${s}${R}`,
+  err: s => `${A.red}${s}${R}`,
+  dim: s => `${A.dim}${s}${R}`,
 };
-
-// ─── UI helpers ────────────────────────────────────────────────────────────
-
-function startSpinner(msg) {
-  const frames = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
-  let i = 0;
-  process.stdout.write(`  ${A.dim}${frames[0]} ${msg}${R}`);
-  const timer = setInterval(() => {
-    process.stdout.write(`\r  ${A.dim}${frames[++i % frames.length]} ${msg}${R}`);
-  }, 80);
-  return (finalMsg) => {
-    clearInterval(timer);
-    process.stdout.write(`\r${' '.repeat(msg.length + 24)}\r`);
-    if (finalMsg) process.stdout.write(`  ${finalMsg}\n`);
-  };
-}
-
-function banner() {
-  const inner = 60;
-  const hr = '─'.repeat(inner);
-  const blank = ' '.repeat(inner);
-  const title = '✉  Gmail Triage';
-  const pad = inner - 2 - title.length;
-  console.log(clr.sep(`╭${hr}╮`));
-  console.log(`${clr.sep('│')}${blank}${clr.sep('│')}`);
-  console.log(`${clr.sep('│')}  ${A.bold}${A.bCyan}${title}${R}${' '.repeat(pad)}${clr.sep('│')}`);
-  console.log(`${clr.sep('│')}${blank}${clr.sep('│')}`);
-  console.log(`${clr.sep(`╰${hr}╯`)}\n`);
-}
-
-function progressBar(done, total) {
-  const pct = Math.floor(done / total * 100);
-  const barW = 24;
-  const filled = Math.round(done / total * barW);
-  const bar = `${A.bGreen}${'█'.repeat(filled)}${R}${A.dim}${'░'.repeat(barW - filled)}${R}`;
-  return `${bar}  ${A.bold}${done}${R}${A.dim}/${total}${R}  ${A.dim}${pct}%${R}`;
-}
 
 // ─── Auth & config ─────────────────────────────────────────────────────────
 
@@ -103,15 +60,6 @@ async function saveLearning(data) {
   await fs.writeFile(LEARNING_PATH, JSON.stringify(data, null, 2));
 }
 
-async function selectAccounts(accounts) {
-  const ALL = 'All accounts';
-  const map = new Map(accounts.map(a => [`${a.name} — ${a.email}`, a]));
-  const choices = [...map.keys(), ALL];
-  const answer = await new Select({ message: 'Select account', choices }).run().catch(() => process.exit(0));
-  if (answer === ALL) return accounts;
-  return [map.get(answer) ?? accounts[0]];
-}
-
 // Bind to the first free port at or after PORT_START instead of dying on EADDRINUSE.
 function listenOnFreePort(server, startPort = PORT_START, tries = PORT_TRIES) {
   return new Promise((resolve, reject) => {
@@ -135,7 +83,8 @@ function listenOnFreePort(server, startPort = PORT_START, tries = PORT_TRIES) {
   });
 }
 
-async function authorize(account) {
+// `onBrowser(url, port)` is called when Google sign-in is needed and the browser is being opened.
+async function authorize(account, { onBrowser = () => {} } = {}) {
   const keys = await loadKeys(account.credentialsFile);
   const tokenPath = path.join(process.cwd(), account.tokenFile);
   const client = new google.auth.OAuth2(keys.client_id, keys.client_secret);
@@ -146,11 +95,9 @@ async function authorize(account) {
     return client;
   } catch { /* need new auth */ }
 
-  console.log(`\nAuthorizing ${account.name} (${account.email})...`);
   const server = http.createServer();
   const port = await listenOnFreePort(server);
   const redirectUri = `http://localhost:${port}`;
-  if (port !== PORT_START) console.log(clr.dim(`  Port ${PORT_START} in use — listening on ${port} instead.`));
 
   return new Promise((resolve, reject) => {
     server.on('error', reject);
@@ -164,11 +111,11 @@ async function authorize(account) {
         const { tokens } = await client.getToken({ code, redirect_uri: redirectUri });
         client.setCredentials(tokens);
         await fs.writeFile(tokenPath, JSON.stringify(tokens, null, 2));
-        console.log(`Token saved for ${account.name}.\n`);
         resolve(client);
       } catch (err) { server.close(); reject(err); }
     });
     const url = client.generateAuthUrl({ access_type: 'offline', scope: SCOPES, prompt: 'consent', login_hint: account.email, redirect_uri: redirectUri });
+    onBrowser(url, port);
     openUrl(url);
   });
 }
@@ -203,10 +150,6 @@ async function fetchBatchMetadata(gmail, refs) {
     emails.push({ id: ref.id, from: get('From'), date: get('Date'), subject: get('Subject'), snippet: msg.data.snippet, labelIds: msg.data.labelIds ?? [] });
   }
   return emails;
-}
-
-async function markAsRead(gmail, id) {
-  await gmail.users.messages.modify({ userId: 'me', id, requestBody: { removeLabelIds: ['UNREAD'] } });
 }
 
 async function withRetry(fn) {
@@ -564,15 +507,13 @@ function applyMessage(rec) {
   return `${msg}. Q to undo.`;
 }
 
-async function reviewBatches(gmail, account, allRefs, totalBatches) {
+async function reviewBatches(screen, gmail, account, allRefs, totalBatches) {
   const learning = await loadLearning();
   const bgState = { inFlight: new Set() };
   const pipeline = batchPipeline(gmail, allRefs, bgState);
-  const session = { account, total: allRefs.length, totalBatches, sorted: 0, canUndo: false };
-  const screen = new tui.Screen({
-    bgState, session,
-    onOpen: id => { openUrl(gmailLink(account, id)); screen.toast('ok', 'Opened in Gmail.'); },
-  });
+  const session = { account, model: screen.session.model, total: allRefs.length, totalBatches, sorted: 0, canUndo: false };
+  screen.session = session;
+  screen.bgState = bgState;
   const applied = [];
   const redo = []; // views to show again before pulling a new batch (after an undo or a failed apply)
   let pulled = 0;
@@ -615,137 +556,219 @@ async function reviewBatches(gmail, account, allRefs, totalBatches) {
     };
   };
 
+  for (;;) {
+    let view = redo.pop();
+    if (!view && !quit) {
+      screen.show({ mode: 'loading', batchNum: pulled + 1, items: [] });
+      const next = await pipeline.next();
+      if (!next.done) {
+        pulled++;
+        view = tui.createView({
+          batchNum: pulled,
+          items: toItems(next.value, learning, account.id),
+          warning: next.value.result.parseWarning ? PARSE_WARNING : null,
+        });
+      }
+    }
+
+    if (!view) {
+      const outcome = await screen.wait(summaryView());
+      if (outcome.type === 'undo') { await undoLast(); continue; }
+      break;
+    }
+
+    const outcome = await screen.wait(view);
+    if (outcome.type === 'quit') {
+      quit = true;
+      redo.length = 0;
+    } else if (outcome.type === 'undo') {
+      redo.push(view);
+      await undoLast();
+    } else if (outcome.type === 'apply') {
+      screen.busy(`Applying batch ${view.batchNum} to Gmail…`);
+      try {
+        const rec = await applyBatch(gmail, account, view, learning, outcome.skipFilters);
+        applied.push(rec);
+        syncSession();
+        screen.toast(rec.failures.length ? 'warn' : 'ok', applyMessage(rec));
+      } catch (err) {
+        screen.toast('err', `Couldn't apply batch ${view.batchNum}: ${err.message}`);
+        redo.push(view);
+      } finally {
+        screen.idle();
+      }
+    }
+  }
+
+  return summaryView().summary;
+}
+
+// ─── Main ──────────────────────────────────────────────────────────────────
+
+// Is the local model reachable and pulled? Checked up front so the overview can say so before
+// you pick "Review by batch", instead of failing a batch later.
+async function checkOllama() {
+  const model = { name: QWEN_MODEL, state: 'offline' };
+  try {
+    const res = await fetch(OLLAMA_URL.replace('/api/chat', '/api/tags'), { signal: AbortSignal.timeout(1500) });
+    if (!res.ok) return model;
+    const { models = [] } = await res.json();
+    const names = new Set(models.flatMap(m => [m.name, m.model]));
+    model.state = names.has(QWEN_MODEL) || names.has(`${QWEN_MODEL}:latest`) ? 'ready' : 'missing';
+  } catch { /* not running */ }
+  return model;
+}
+
+function accountsView(accounts, learning) {
+  return {
+    mode: 'accounts', cur: 0,
+    accounts: accounts.map(a => {
+      const acc = learning[a.id] ?? {};
+      const senders = ['neutral', 'important', 'spam'].flatMap(k => Object.values(acc[k] ?? {}));
+      return {
+        name: a.name, email: a.email, tokenFile: a.tokenFile,
+        signedIn: existsSync(path.join(process.cwd(), a.tokenFile)),
+        senders: senders.length,
+        filters: senders.filter(s => s.filterId).length,
+      };
+    }),
+  };
+}
+
+function overviewView(account, unread, model) {
+  const batches = Math.ceil(unread / BATCH_SIZE);
+  const notReady = model.state === 'offline'
+    ? 'Needs Ollama. Run `ollama serve`, then come back to this inbox.'
+    : model.state === 'missing' ? `Needs the model. Run \`ollama pull ${model.name}\`.` : null;
+  const options = unread
+    ? [
+      { key: 'review', label: 'Review by batch', desc: 'The hat sorts each batch. You confirm every change before it reaches Gmail.', disabled: notReady },
+      { key: 'markAll', label: 'Mark all as read', desc: `Marks all ${unread} read without sorting. This can't be undone from here.` },
+      { key: 'skip', label: 'Skip this inbox', desc: 'Leave everything as it is.' },
+    ]
+    : [{ key: 'skip', label: 'Continue', desc: 'Nothing to sort in this inbox.' }];
+  return { mode: 'start', title: 'Inbox overview', unread, batches, batchSize: BATCH_SIZE, options, cur: notReady && unread ? 1 : 0 };
+}
+
+async function markAllRead(screen, gmail, account, refs) {
+  const view = {
+    mode: 'steps', title: 'Mark all as read',
+    steps: [{ state: 'active', text: `Marking ${refs.length} emails as read…` }],
+    progress: { done: 0, total: refs.length },
+  };
+  screen.show(view);
+  const ids = refs.map(r => r.id);
+  for (let i = 0; i < ids.length; i += 500) {
+    await batchModify(gmail, ids.slice(i, i + 500), { remove: ['UNREAD'] });
+    view.progress.done = Math.min(i + 500, ids.length);
+    screen.draw();
+  }
+  view.steps[0] = { state: 'done', text: `Marked ${ids.length} emails as read` };
+  view.continue = true;
+  await screen.wait(view);
+}
+
+async function runAccount(screen, account) {
+  screen.bgState = { inFlight: new Set() };
+  screen.session = { account, model: screen.session.model };
+  const steps = [
+    { state: 'active', text: `Signing in to ${account.email}…` },
+    { state: 'todo', text: 'Count unread mail' },
+  ];
+  const view = { mode: 'steps', title: 'Opening inbox', steps };
+  screen.show(view);
+
+  const auth = await authorize(account, {
+    onBrowser(url, port) {
+      steps[0].text = 'Waiting for you to sign in to Google in your browser…';
+      steps[0].detail = `Listening on localhost:${port}. Press E if the page didn't open.`;
+      view.url = url;
+      screen.draw();
+    },
+  });
+  delete view.url;
+  steps[0] = { state: 'done', text: `Signed in as ${account.email}` };
+  steps[1] = { state: 'active', text: 'Counting unread mail…' };
+  screen.draw();
+
+  const gmail = google.gmail({ version: 'v1', auth });
+  const [refs, model] = await Promise.all([getAllMessageRefs(gmail), checkOllama()]);
+  screen.session.model = model;
+
+  const choice = await screen.wait(overviewView(account, refs.length, model));
+  if (choice.type === 'quit') return { account, kind: 'skipped', unread: refs.length, quit: true };
+  if (choice.type === 'skip') return { account, kind: refs.length ? 'skipped' : 'empty', unread: refs.length };
+  if (choice.type === 'markAll') {
+    await markAllRead(screen, gmail, account, refs);
+    return { account, kind: 'markAll', count: refs.length };
+  }
+  const summary = await reviewBatches(screen, gmail, account, refs, Math.ceil(refs.length / BATCH_SIZE));
+  return { account, kind: 'review', summary, unread: refs.length };
+}
+
+// One line per inbox, printed after the full-screen UI closes so the run stays in scrollback.
+function printResults(results) {
+  if (!results.length) return;
+  console.log(`\n  ${A.bold}${A.bYellow}the-sorting-hat${R}`);
+  const nameW = Math.max(...results.map(r => r.account.name.length));
+  for (const r of results) {
+    const name = r.account.name.padEnd(nameW);
+    if (r.kind === 'review') {
+      const s = r.summary;
+      const left = r.unread - s.emails;
+      console.log(`  ${clr.ok('✓')} ${A.bold}${name}${R}  sorted ${s.emails}: ${s.star} starred, ${s.read} read, ${s.spam} to spam, ${s.filters} new filter${s.filters === 1 ? '' : 's'}${left ? clr.dim(` · ${left} left unread`) : ''}`);
+    } else if (r.kind === 'markAll') {
+      console.log(`  ${clr.ok('✓')} ${A.bold}${name}${R}  marked ${r.count} as read`);
+    } else if (r.kind === 'empty') {
+      console.log(`  ${clr.ok('✓')} ${A.bold}${name}${R}  ${clr.dim('nothing unread')}`);
+    } else {
+      console.log(`  ${clr.dim('·')} ${A.bold}${name}${R}  ${clr.dim(`skipped, ${r.unread} unread left`)}`);
+    }
+  }
+  console.log('');
+}
+
+async function main() {
+  if (!process.stdin.isTTY || !process.stdout.isTTY) {
+    console.log(`${clr.err('!')} the-sorting-hat needs an interactive terminal.`);
+    return;
+  }
+  const accounts = await loadAccounts();
+  const [learning, model] = await Promise.all([loadLearning(), checkOllama()]);
+  const screen = new tui.Screen({
+    session: { model },
+    onAction(outcome) {
+      if (outcome.type === 'reopen') openUrl(outcome.url);
+      if (outcome.type === 'open') {
+        openUrl(gmailLink(screen.session.account, outcome.id));
+        screen.toast('ok', 'Opened in Gmail.');
+      }
+    },
+  });
+
+  const results = [];
   screen.open();
   try {
-    for (;;) {
-      let view = redo.pop();
-      if (!view && !quit) {
-        screen.show({ mode: 'loading', batchNum: pulled + 1, items: [] });
-        const next = await pipeline.next();
-        if (!next.done) {
-          pulled++;
-          view = tui.createView({
-            batchNum: pulled,
-            items: toItems(next.value, learning, account.id),
-            warning: next.value.result.parseWarning ? PARSE_WARNING : null,
-          });
-        }
-      }
-
-      if (!view) {
-        const outcome = await screen.wait(summaryView());
-        if (outcome.type === 'undo') { await undoLast(); continue; }
-        break;
-      }
-
-      const outcome = await screen.wait(view);
-      if (outcome.type === 'quit') {
-        quit = true;
-        redo.length = 0;
-      } else if (outcome.type === 'undo') {
-        redo.push(view);
-        await undoLast();
-      } else if (outcome.type === 'apply') {
-        screen.busy(`Applying batch ${view.batchNum} to Gmail…`);
-        try {
-          const rec = await applyBatch(gmail, account, view, learning, outcome.skipFilters);
-          applied.push(rec);
-          syncSession();
-          screen.toast(rec.failures.length ? 'warn' : 'ok', applyMessage(rec));
-        } catch (err) {
-          screen.toast('err', `Couldn't apply batch ${view.batchNum}: ${err.message}`);
-          redo.push(view);
-        } finally {
-          screen.idle();
-        }
+    const picked = await screen.wait(accountsView(accounts, learning));
+    if (picked.type === 'pick') {
+      const selected = picked.index >= accounts.length ? accounts : [accounts[picked.index]];
+      for (const account of selected) {
+        const result = await runAccount(screen, account);
+        results.push(result);
+        if (result.quit) break;
       }
     }
   } finally {
     screen.close();
   }
-
-  const s = summaryView().summary;
-  console.log(`  ${clr.ok('✓')} Sorted ${A.bold}${s.emails}${R} — ${s.star} starred, ${s.read} read, ${s.spam} to spam, ${s.filters} new filter${s.filters === 1 ? '' : 's'}`);
-}
-
-// ─── Main ──────────────────────────────────────────────────────────────────
-
-async function processAccount(account) {
-  const auth = await authorize(account);
-  const gmail = google.gmail({ version: 'v1', auth });
-
-  console.log(`\n${clr.sep('─'.repeat(60))}`);
-  console.log(`  ${A.bold}${account.name}${R}  ${clr.dim(account.email)}`);
-
-  const stopSpin = startSpinner('Loading message list...');
-  const allRefs = await getAllMessageRefs(gmail);
-  stopSpin();
-
-  if (allRefs.length === 0) { console.log(`  ${clr.dim('No unread messages.')}`); return; }
-
-  const totalBatches = Math.ceil(allRefs.length / BATCH_SIZE);
-  console.log(`  ${A.cyan}${allRefs.length}${R} unread  ${clr.dim('·')}  ${totalBatches} batch${totalBatches > 1 ? 'es' : ''} of ${BATCH_SIZE}`);
-
-  const MARK_ALL = 'Mark all as read';
-  const SKIP = 'Skip';
-  const action = await new Select({
-    message: 'What would you like to do?',
-    choices: ['Review by batch', MARK_ALL, SKIP],
-  }).run().catch(() => SKIP);
-
-  if (action === SKIP) return;
-
-  if (action === MARK_ALL) {
-    const markWithRetry = async (id) => {
-      for (let attempt = 0; ; attempt++) {
-        try { return await markAsRead(gmail, id); }
-        catch (err) {
-          if (err.status === 429 && attempt < 5) await new Promise(r => setTimeout(r, 300 * Math.pow(2, attempt)));
-          else throw err;
-        }
-      }
-    };
-    let done = 0;
-    const frames = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
-    let fi = 0;
-    const printProgress = () => {
-      const bar = progressBar(done, allRefs.length);
-      process.stdout.write(`\r  ${A.dim}${frames[fi++ % frames.length]}${R} ${bar}   `);
-    };
-    printProgress();
-    const timer = setInterval(printProgress, 80);
-    for (let i = 0; i < allRefs.length; i += 5) {
-      await Promise.all(allRefs.slice(i, i + 5).map(ref => markWithRetry(ref.id)));
-      done = Math.min(i + 5, allRefs.length);
-    }
-    clearInterval(timer);
-    process.stdout.write(`\r  ${clr.ok('✓')} Marked ${A.bold}${allRefs.length}${R} as read${' '.repeat(50)}\n`);
-    return;
-  }
-
-  if (!process.stdin.isTTY) {
-    console.log(`  ${clr.err('!')} Batch review needs an interactive terminal.`);
-    return;
-  }
-  await reviewBatches(gmail, account, allRefs, totalBatches);
-}
-
-async function main() {
-  console.clear();
-  banner();
-  const accounts = await loadAccounts();
-  const selected = await selectAccounts(accounts);
-
-  for (const account of selected) {
-    await processAccount(account);
-    if (selected.length > 1) console.log(`\n${clr.sep('═'.repeat(60))}`);
-  }
-
-  console.log(`\n  ${clr.ok('✓')} All done\n`);
+  printResults(results);
 }
 
 if (require.main === module) {
-  main().catch(console.error).finally(() => process.exit(0));
+  main().then(() => process.exit(0), err => {
+    console.error(err);
+    process.exit(1);
+  });
 }
 
 module.exports = { authorize, loadAccounts, loadLearning, analyzeWithQwen, isJobEmail, isProtectedJobSender, toItems, applyBatch, revertBatch, QWEN_MODEL };

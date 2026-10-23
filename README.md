@@ -94,9 +94,17 @@ Then in a separate terminal (or if Ollama is already running as a background ser
 email
 ```
 
-The terminal clears, a banner appears, you pick an account, and the hat goes to work.
+The hat opens full screen. Pick an inbox (or all of them in a row). Each row shows whether that inbox is signed in and how much the hat has learned about it. The header shows whether Ollama and the model are ready.
 
-**First run:** a browser window opens for the Google OAuth flow. After that, tokens are cached locally.
+![Choose an inbox](docs/screenshots/after-start-1-accounts.png)
+
+Next comes the inbox overview: the unread count and three choices. **Review by batch** is greyed out with the fix if Ollama isn't running. **Mark all as read** asks for a second `E` before it touches anything.
+
+![Inbox overview](docs/screenshots/after-start-2-overview.png)
+
+When you leave, a one-line result per inbox stays in your terminal's scrollback.
+
+**First run:** your browser opens for Google sign-in, and the screen waits until you finish (`E` reopens the page if it didn't appear). After that, tokens are cached locally.
 
 ### Batch review
 

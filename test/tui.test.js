@@ -174,6 +174,89 @@ test('the summary footer offers undo only when a batch can be undone', () => {
   assert.doesNotMatch(footer(false), /undo/);
 });
 
+const accounts = () => ({
+  mode: 'accounts', cur: 0,
+  accounts: [
+    { name: 'Personal', email: 'you@gmail.com', tokenFile: 'token-personal.json', signedIn: true, senders: 12, filters: 2 },
+    { name: 'Work', email: 'you@work.example', tokenFile: 'token-work.json', signedIn: false, senders: 0, filters: 0 },
+  ],
+});
+const overview = (unread = 127, disabled = null) => ({
+  mode: 'start', title: 'Inbox overview', unread, batches: Math.ceil(unread / 15), batchSize: 15, cur: 0,
+  options: [
+    { key: 'review', label: 'Review by batch', desc: 'Sort and confirm.', disabled },
+    { key: 'markAll', label: 'Mark all as read', desc: 'Marks everything read.' },
+    { key: 'skip', label: 'Skip this inbox', desc: 'Leave everything as it is.' },
+  ],
+});
+
+test('inbox picker: W/S and number keys move, E picks, the extra row means all inboxes', () => {
+  const v = accounts();
+  assert.deepEqual(tui.handleKey(v, key('e')), { type: 'pick', index: 0 });
+  tui.handleKey(v, key('s'));
+  tui.handleKey(v, key('s'));
+  assert.deepEqual(tui.handleKey(v, key('e')), { type: 'pick', index: 2 }, 'row after the accounts is "All inboxes"');
+  tui.handleKey(v, key('s'));
+  assert.equal(v.cur, 2, 'cursor stops at the last row');
+  tui.handleKey(v, key('2'));
+  assert.equal(v.cur, 1);
+  assert.deepEqual(tui.handleKey(v, key('q')), { type: 'quit' });
+});
+
+test('overview: mark all as read needs a second E, and Q cancels it', () => {
+  const v = overview();
+  v.cur = 1;
+  assert.equal(tui.handleKey(v, key('e'), { now: 1000 }), null);
+  assert.equal(v.confirm, true);
+  assert.equal(tui.handleKey(v, key('e'), { now: 1100 }), null, 'a held E does not confirm');
+  assert.deepEqual(tui.handleKey(v, key('e'), { now: 2000 }), { type: 'markAll' });
+  const w = overview();
+  w.cur = 1;
+  tui.handleKey(w, key('e'), { now: 0 });
+  tui.handleKey(w, key('q'), { now: 1000 });
+  assert.equal(w.confirm, false);
+});
+
+test('overview: review is refused with the reason when the model is unavailable', () => {
+  const v = overview(40, 'Needs Ollama.');
+  assert.equal(tui.handleKey(v, key('e')), null);
+  assert.match(v.toast.text, /Needs Ollama/);
+  v.cur = 2;
+  assert.deepEqual(tui.handleKey(v, key('e')), { type: 'skip' });
+  assert.deepEqual(tui.handleKey(v, key('q', true)), { type: 'quit' });
+});
+
+test('sign-in step: E reopens the browser while waiting; continue only when done', () => {
+  const v = { mode: 'steps', steps: [{ state: 'active', text: 'Waiting' }], url: 'https://accounts.google.com/x' };
+  assert.deepEqual(tui.handleKey(v, key('e')), { type: 'reopen', url: 'https://accounts.google.com/x' });
+  const done = { mode: 'steps', steps: [{ state: 'done', text: 'Marked 3 as read' }], continue: true };
+  assert.deepEqual(tui.handleKey(done, key('e')), { type: 'continue' });
+});
+
+test('block digits stay three rows high and line up', () => {
+  const rows = tui.bigNumber(1207);
+  assert.equal(rows.length, 3);
+  assert.ok(rows.every(r => tui.strWidth(r) === tui.strWidth(rows[0])));
+});
+
+test('start screens fit the terminal at every size', () => {
+  const session = { account: { name: 'Personal', email: 'you@gmail.com' }, model: { name: 'qwen2.5-coder:14b', state: 'ready' } };
+  const views = [
+    accounts(),
+    overview(),
+    overview(0),
+    { mode: 'steps', title: 'Opening inbox', steps: [{ state: 'done', text: 'Signed in' }, { state: 'active', text: 'Waiting for you to sign in to Google in your browser…', detail: 'Listening on localhost:3000.' }], url: 'x' },
+    { mode: 'steps', title: 'Mark all as read', steps: [{ state: 'active', text: 'Marking…' }], progress: { done: 60, total: 127 } },
+  ];
+  for (const [cols, rows] of [[80, 24], [100, 32], [140, 45]]) {
+    for (const v of views) {
+      const lines = tui.render(v, { cols, rows, session, frame: 0 });
+      assert.equal(lines.length, rows);
+      for (const l of lines) assert.ok(tui.strWidth(strip(l)) <= cols - 1, `${v.mode} at ${cols}x${rows}: "${strip(l)}"`);
+    }
+  }
+});
+
 test('strWidth counts emoji and CJK as two cells', () => {
   assert.equal(tui.strWidth('abc'), 3);
   assert.equal(tui.strWidth('🎉 sale'), 7);

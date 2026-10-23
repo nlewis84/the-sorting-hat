@@ -214,6 +214,46 @@ function handleKey(v, key, ctx = {}) {
   const shift = !!key?.shift;
   const now = ctx.now ?? Date.now();
 
+  if (v.mode === 'accounts') {
+    const count = v.accounts.length + (v.accounts.length > 1 ? 1 : 0);
+    switch (name) {
+      case 'w': case 'up': v.cur = Math.max(0, v.cur - 1); return null;
+      case 's': case 'down': v.cur = Math.min(count - 1, v.cur + 1); return null;
+      case 'e': case 'return': return { type: 'pick', index: v.cur };
+      case 'q': case 'escape': return { type: 'quit' };
+      default:
+        if (/^[1-9]$/.test(name ?? '') && Number(name) <= count) v.cur = Number(name) - 1;
+        return null;
+    }
+  }
+
+  if (v.mode === 'start') {
+    if (v.confirm) {
+      if (name === 'e' || name === 'return') return now - v.confirmAt < REPEAT_GUARD_MS ? null : { type: 'markAll' };
+      if (name === 'q' || name === 'escape' || name === 'w' || name === 's' || name === 'up' || name === 'down') v.confirm = false;
+      return null;
+    }
+    switch (name) {
+      case 'w': case 'up': v.cur = Math.max(0, v.cur - 1); return null;
+      case 's': case 'down': v.cur = Math.min(v.options.length - 1, v.cur + 1); return null;
+      case 'e': case 'return': {
+        const o = v.options[v.cur];
+        if (o.disabled) { toast(v, 'warn', o.disabled); return null; }
+        if (o.key === 'markAll') { v.confirm = true; v.confirmAt = now; return null; }
+        return { type: o.key };
+      }
+      case 'q': return shift ? { type: 'quit' } : { type: 'skip' };
+      case 'escape': return { type: 'skip' };
+      default: return null;
+    }
+  }
+
+  if (v.mode === 'steps') {
+    if (v.continue && (name === 'e' || name === 'return')) return { type: 'continue' };
+    if (v.url && name === 'e') return { type: 'reopen', url: v.url };
+    return null;
+  }
+
   if (v.mode === 'summary') {
     if (name === 'q' && !shift) {
       if (ctx.canUndo) return { type: 'undo' };
@@ -494,9 +534,22 @@ function footerLines(v, ctx, width) {
   else if (t) status = [seg(`${TOAST_GLYPH[t.kind]} `, TOAST_ST[t.kind]), seg(t.text, t.kind === 'info' ? ST.dim : null)];
   else if (v.warning) status = [seg('! ', ST.jnk), seg(v.warning, ST.dim)];
   else if (v.mode === 'review') status = [seg('? ', ST.ok), seg(`Apply batch ${v.batchNum} to Gmail?`, ST.bold)];
+  else if (v.mode === 'start' && v.confirm) status = [seg('? ', ST.warn), seg(`Mark all ${v.unread} as read?`, ST.bold), seg(' Nothing gets sorted or learned.', ST.dim)];
 
   let groups;
-  if (v.mode === 'review') {
+  if (v.mode === 'accounts') {
+    groups = [
+      [{ k: 'W/S', l: 'move' }, { k: '1-9', l: 'pick', opt: true }],
+      [{ k: 'E', l: 'open' }],
+      [{ k: 'Q', l: 'quit' }],
+    ];
+  } else if (v.mode === 'start') {
+    groups = v.confirm
+      ? [[{ k: 'E', l: 'mark all read' }], [{ k: 'Q', l: 'cancel' }]]
+      : [[{ k: 'W/S', l: 'choose' }], [{ k: 'E', l: 'go' }], [{ k: 'Q', l: v.unread ? 'skip inbox' : 'continue' }, { k: '⇧Q', l: 'quit', opt: true }]];
+  } else if (v.mode === 'steps') {
+    groups = v.url ? [[{ k: 'E', l: 'open the sign-in page again' }]] : v.continue ? [[{ k: 'E', l: 'continue' }]] : [];
+  } else if (v.mode === 'review') {
     const tile = TILES[v.tile];
     const e = selectedReviewItem(v);
     groups = [
@@ -521,16 +574,122 @@ function footerLines(v, ctx, width) {
   return [status, keyChips(groups, width)];
 }
 
+// Whether the local model can sort right now: { name, state: 'ready' | 'missing' | 'offline' }.
+function modelSegs(m) {
+  if (!m) return [];
+  if (m.state === 'ready') return [seg('● ', ST.ok), seg(`${m.name} ready`, ST.dim)];
+  if (m.state === 'missing') return [seg('● ', ST.warn), seg(`${m.name} isn't pulled`, ST.dim)];
+  return [seg('○ ', ST.jnk), seg("Ollama isn't running", ST.dim)];
+}
+
+const bar = (done, total, w, st = ST.ok) => {
+  const f = Math.round(Math.min(1, done / Math.max(1, total)) * w);
+  return [seg('━'.repeat(f), st), seg('─'.repeat(w - f), ST.line)];
+};
+
 function headerLine(ctx, width) {
-  const s = ctx.session;
-  const done = s.sorted ?? 0;
-  const total = Math.max(1, s.total ?? 1);
-  const barW = 24;
-  const f = Math.round(done / total * barW);
-  const left = [seg('the-sorting-hat', ST.bold, ST.imp), seg(' › ', ST.line), seg(clean(s.account?.name ?? ''), ST.bold), seg(`  ${clean(s.account?.email ?? '')}`, ST.dim)];
-  const right = [seg('━'.repeat(f), ST.ok), seg('─'.repeat(barW - f), ST.line), seg(`  ${done}`, ST.bold), seg(`/${s.total ?? 0} sorted`, ST.dim)];
+  const s = ctx.session ?? {};
+  const left = [seg('the-sorting-hat', ST.bold, ST.imp)];
+  if (s.account) left.push(seg(' › ', ST.line), seg(clean(s.account.name), ST.bold), seg(`  ${clean(s.account.email)}`, ST.dim));
+  // While sorting, the right side tracks progress; before that it says whether the model is ready.
+  const right = s.total != null
+    ? [...bar(s.sorted ?? 0, s.total, 24), seg(`  ${s.sorted ?? 0}`, ST.bold), seg(`/${s.total} sorted`, ST.dim)]
+    : modelSegs(s.model);
   const gap = width - segsWidth(left) - segsWidth(right);
   return gap >= 2 ? [...left, seg(' '.repeat(gap)), ...right] : fitSegs(left, width);
+}
+
+// ─── Start screens: inbox picker, sign-in steps, inbox overview ───────────
+
+// Three-row block digits for the unread count on the overview.
+const DIGITS = {
+  0: ['█▀█', '█ █', '▀▀▀'], 1: ['▀█ ', ' █ ', '▀▀▀'], 2: ['▀▀█', '█▀▀', '▀▀▀'], 3: ['▀▀█', ' ▀█', '▀▀▀'],
+  4: ['█ █', '▀▀█', '  ▀'], 5: ['█▀▀', '▀▀█', '▀▀▀'], 6: ['█▀▀', '█▀█', '▀▀▀'], 7: ['▀▀█', '  █', '  ▀'],
+  8: ['█▀█', '█▀█', '▀▀▀'], 9: ['█▀█', '▀▀█', '▀▀▀'],
+};
+const bigNumber = n => [0, 1, 2].map(r => [...String(n)].map(d => DIGITS[d][r]).join(' '));
+
+const plural = (n, word, many = `${word}s`) => `${n} ${n === 1 ? word : many}`;
+
+function accountsLines(v, inner) {
+  const n = v.accounts.length;
+  const emailW = Math.max(10, Math.min(34, inner - (2 + 2 + 2 + 18 + 2 + 2 + 26)));
+  const row = (i, glyph, name, email, status) => ({
+    segs: [seg(i === v.cur ? '▸ ' : '  ', ST.imp), seg(`${i + 1} `, ST.dim), ...glyph, seg(' '), seg(fit(name, 18), ST.bold),
+      seg('  '), seg(fit(email, emailW), ST.dim), seg('  '), ...fitSegs(status, 26)],
+    bg: i === v.cur ? ST.selBg : null,
+  });
+  const lines = v.accounts.map((a, i) => row(i,
+    [seg(a.signedIn ? '●' : '○', a.signedIn ? ST.ok : ST.dim)], a.name, a.email,
+    a.signedIn ? [seg('signed in', ST.dim)] : [seg('needs sign-in', ST.warn)]));
+  if (n > 1) {
+    lines.push({ segs: [] });
+    lines.push(row(n, [seg('≡', ST.imp)], 'All inboxes', v.accounts.map(a => a.name).join(', '), [seg(`${n} in a row`, ST.dim)]));
+  }
+  return { lines, cursorLine: v.cur < n ? v.cur : lines.length - 1 };
+}
+
+function accountDetail(v) {
+  const label = t => seg(t.padEnd(8), ST.dim);
+  const learned = a => (a.senders
+    ? [seg(plural(a.senders, 'sender')), seg(` · ${plural(a.filters, 'filter')} created by the hat`, ST.dim)]
+    : [seg('Nothing yet. Corrections you make are remembered here.', ST.dim)]);
+  if (v.cur >= v.accounts.length) {
+    const missing = v.accounts.filter(a => !a.signedIn).length;
+    return [
+      { segs: [label('Order'), seg(v.accounts.map(a => a.name).join(' → '))] },
+      { segs: [label('Sign-in'), missing ? seg(`${missing} of ${v.accounts.length} will open your browser to sign in`, ST.warn) : seg('all saved')] },
+      { segs: [label('Learned'), seg(plural(v.accounts.reduce((s, a) => s + a.senders, 0), 'sender')),
+        seg(` · ${plural(v.accounts.reduce((s, a) => s + a.filters, 0), 'filter')} across every inbox`, ST.dim)] },
+    ];
+  }
+  const a = v.accounts[v.cur];
+  return [
+    { segs: [label('Email'), seg(clean(a.email))] },
+    { segs: [label('Sign-in'), ...(a.signedIn ? [seg('saved'), seg(`  ${clean(a.tokenFile)}`, ST.dim)] : [seg('needs sign-in', ST.warn), seg('  your browser opens when you continue', ST.dim)])] },
+    { segs: [label('Learned'), ...learned(a)] },
+  ];
+}
+
+const STEP_GLYPH = { done: ['✓', ST.ok], todo: ['·', ST.dim], fail: ['!', ST.jnk] };
+
+function stepsLines(v, frame, inner) {
+  const lines = [{ segs: [] }];
+  for (const s of v.steps) {
+    const [g, st] = s.state === 'active' ? [FRAMES[frame % FRAMES.length], ST.imp] : STEP_GLYPH[s.state];
+    lines.push({ segs: [seg('  '), seg(g, st), seg(' '), seg(clean(s.text), s.state === 'todo' ? ST.dim : null)] });
+    if (s.detail) lines.push({ segs: [seg('    '), seg(clean(s.detail), ST.dim)] });
+  }
+  if (v.progress) {
+    const { done, total } = v.progress;
+    lines.push({ segs: [] });
+    lines.push({ segs: [seg('    '), ...bar(done, total, Math.min(48, inner - 30)), seg(`  ${done}`, ST.bold), seg(`/${total}`, ST.dim), seg(`  ${Math.floor(done / Math.max(1, total) * 100)}%`, ST.dim)] });
+  }
+  return lines;
+}
+
+function startLines(v, ctx, inner) {
+  const big = bigNumber(v.unread);
+  const bigW = strWidth(big[0]);
+  const side = v.unread
+    ? [
+      [seg(v.unread === 1 ? 'unread email' : 'unread emails', ST.bold)],
+      [seg(`${plural(v.batches, 'batch', 'batches')} of ${v.batchSize}`, ST.dim)],
+      modelSegs(ctx.session?.model),
+    ]
+    : [[seg('Inbox zero.', ST.bold, ST.ok)], [seg('Nothing unread here.', ST.dim)], []];
+  const lines = [{ segs: [] }];
+  big.forEach((b, i) => lines.push({ segs: [seg('  '), seg(b, ST.bold, v.unread ? ST.imp : ST.ok), seg(' '.repeat(Math.max(3, 8 - bigW + 3))), ...side[i]] }));
+  lines.push({ segs: [] }, { segs: [] });
+  const descW = Math.max(10, inner - (2 + 20));
+  v.options.forEach((o, i) => {
+    const sel = i === v.cur;
+    let desc = [seg(fit(o.desc, descW), ST.dim)];
+    if (o.disabled) desc = [seg(fit(o.disabled, descW), ST.warn)];
+    if (sel && v.confirm) desc = [seg(fit(`Press E again to mark all ${v.unread} as read. Q cancels.`, descW), ST.warn)];
+    lines.push({ segs: [seg(sel ? '▸ ' : '  ', ST.imp), seg(fit(o.label, 20), o.disabled ? ST.dim : ST.bold), ...desc], bg: sel ? ST.selBg : null });
+  });
+  return lines;
 }
 
 function nextBatchStatus(v, ctx) {
@@ -553,7 +712,19 @@ function render(v, ctx) {
   const fixed = 2 + footer.length; // header + spacer, footer
   const out = [headerLine(ctx, width), []];
 
-  if (v.mode === 'summary' || v.mode === 'loading') {
+  if (v.mode === 'accounts') {
+    // Start screens size their panes to the content; the key bar stays pinned to the bottom.
+    const { lines, cursorLine } = accountsLines(v, inner);
+    const detailH = rows >= 22 ? 5 : 0;
+    const mainH = Math.min(rows - fixed - detailH, lines.length + 4);
+    const { visible, footMeta } = windowed(v, 'scroll', [{ segs: [] }, ...lines], cursorLine + 1, mainH - 2);
+    out.push(...pane({ title: [seg('Choose an inbox', ST.bold)], meta: [seg(plural(v.accounts.length, 'account'), ST.dim)], footMeta, lines: visible, width, height: mainH }));
+    if (detailH) out.push(...pane({ title: [seg(v.cur < v.accounts.length ? v.accounts[v.cur].name : 'All inboxes', ST.bold)], lines: accountDetail(v), width, height: detailH }));
+  } else if (v.mode === 'start' || v.mode === 'steps') {
+    const lines = v.mode === 'start' ? startLines(v, ctx, inner) : stepsLines(v, ctx.frame, inner);
+    const meta = v.mode === 'start' ? [seg(v.unread ? 'nothing changes until you choose' : 'all caught up', ST.dim)] : [];
+    out.push(...pane({ title: [seg(v.title ?? 'Inbox', ST.bold)], meta, lines, width, height: Math.min(rows - fixed, lines.length + 3) }));
+  } else if (v.mode === 'summary' || v.mode === 'loading') {
     const h = rows - fixed;
     let lines;
     let title;
@@ -572,16 +743,17 @@ function render(v, ctx) {
     const mainH = rows - fixed - previewH;
     if (v.mode === 'review') {
       const { lines, cursorLine } = reviewLines(v, inner);
-      const { visible, footMeta } = windowed(v, 'reviewScroll', lines, cursorLine, mainH - 2);
+      const { visible, footMeta } = windowed(v, 'reviewScroll', [{ segs: [] }, ...lines], cursorLine + 1, mainH - 2);
       out.push(...pane({ title: batchTitle('Review'), meta: [seg('nothing sent to Gmail yet', ST.dim)], footMeta, lines: visible, width, height: mainH }));
       if (previewH) out.push(...pane({ title: [seg('Selected email', ST.bold)], lines: detailLines(selectedReviewItem(v), inner, 'review'), width, height: previewH }));
     } else {
       const { lines, cursorLine, showTag } = listLines(v, inner);
-      const { visible, footMeta } = windowed(v, 'scroll', lines, cursorLine, mainH - 2);
+      const { visible, footMeta } = windowed(v, 'scroll', [{ segs: [] }, ...lines], cursorLine + 1, mainH - 2);
       out.push(...pane({ title: batchTitle('Inbox'), meta: nextBatchStatus(v, ctx), footMeta, lines: visible, width, height: mainH }));
       if (previewH) out.push(...pane({ title: [seg('Preview', ST.bold)], lines: detailLines(current(v), inner, 'list', showTag), width, height: previewH }));
     }
   }
+  while (out.length < rows - footer.length) out.push([]);
   out.push(...footer);
   return out.slice(0, rows).map(segs => toAnsi(fitSegs(segs, width)));
 }
@@ -589,8 +761,10 @@ function render(v, ctx) {
 // ─── Terminal driver ───────────────────────────────────────────────────────
 
 class Screen {
-  constructor({ stdin = process.stdin, stdout = process.stdout, bgState = { inFlight: new Set() }, session = {}, onOpen = () => {} } = {}) {
-    Object.assign(this, { stdin, stdout, bgState, session, onOpen });
+  // onAction handles outcomes that don't end the current screen: { type: 'open', id } opens an
+  // email in Gmail, { type: 'reopen', url } reopens the Google sign-in page.
+  constructor({ stdin = process.stdin, stdout = process.stdout, bgState = { inFlight: new Set() }, session = {}, onAction = () => {} } = {}) {
+    Object.assign(this, { stdin, stdout, bgState, session, onAction });
     this.view = null;
     this.resolve = null;
     this.toastState = null;
@@ -659,7 +833,8 @@ class Screen {
     const v = this.view;
     if (!v) return;
     const toastLive = this.toastState && Date.now() - this.toastState.at < TOAST_MS + 200;
-    if (v.busy || v.mode === 'loading' || this.bgState.inFlight.size || toastLive) this.draw();
+    const spinning = v.mode === 'steps' && v.steps.some(s => s.state === 'active');
+    if (v.busy || v.mode === 'loading' || spinning || this.bgState.inFlight.size || toastLive) this.draw();
   }
 
   onKey(str, key = {}) {
@@ -668,14 +843,16 @@ class Screen {
       process.exit(130);
     }
     const v = this.view;
-    if (!v || !this.resolve) return;
+    // Keys only count on a screen that's waiting for an answer, or on the sign-in step (E reopens
+    // the browser while the app waits on Google).
+    if (!v || v.busy || (!this.resolve && !v.url)) return;
     const k = { name: key.name ?? str, shift: !!key.shift };
     const now = Date.now();
     if ((k.name === 'e' || k.name === 'q') && now - this.lastResolveAt < REPEAT_GUARD_MS) return;
     const outcome = handleKey(v, k, { now, canUndo: !!this.session.canUndo });
     if (v.toast) { this.toastState = { ...v.toast, at: now }; delete v.toast; }
-    if (outcome?.type === 'open') this.onOpen(outcome.id);
-    else if (outcome) {
+    if (outcome?.type === 'open' || outcome?.type === 'reopen') this.onAction(outcome);
+    else if (outcome && this.resolve) {
       const resolve = this.resolve;
       this.resolve = null;
       this.lastResolveAt = now;
@@ -697,5 +874,5 @@ class Screen {
 
 module.exports = {
   Screen, createView, handleKey, render, plan, action, effRead, filterDue, willFilter, learnKind,
-  strWidth, fit, TILES, FILTER_THRESHOLD,
+  strWidth, fit, bigNumber, TILES, FILTER_THRESHOLD,
 };
