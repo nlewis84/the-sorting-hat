@@ -94,21 +94,50 @@ Then in a separate terminal (or if Ollama is already running as a background ser
 email
 ```
 
-The terminal clears, a banner appears, you pick an account, and the hat goes to work.
+The hat opens full screen. Pick an inbox (or all of them in a row). Each row shows whether that inbox is signed in and how much the hat has learned about it. The header shows whether Ollama and the model are ready.
 
-**First run:** a browser window opens for the Google OAuth flow. After that, tokens are cached locally.
+![Choose an inbox](docs/screenshots/after-start-1-accounts.png)
+
+Next comes the inbox overview: the unread count and three choices. **Review by batch** is greyed out with the fix if Ollama isn't running. **Mark all as read** asks for a second `E` before it touches anything.
+
+![Inbox overview](docs/screenshots/after-start-2-overview.png)
+
+When you leave, a one-line result per inbox stays in your terminal's scrollback.
+
+**First run:** your browser opens for Google sign-in, and the screen waits until you finish (`E` reopens the page if it didn't appear). After that, tokens are cached locally.
 
 ### Batch review
 
-Emails come in batches of 15. For each batch:
+Emails come in batches of 15, and each batch gets one full screen: every email sorted into its house, with a preview of the selected one and the hat's reason for its pick.
 
-1. **Important** — decide if any should be demoted to neutral, then star the rest. Optionally mark any as read.
-2. **Neutral** — promote any to important, then mark the rest as read (or skip).
-3. **Junk** — rescue anything misclassified, spam the rest.
+![Batch review](docs/screenshots/after-1-inbox.png)
+
+The controls sit under a resting WASD hand:
+
+| Key | In the list | On the review screen |
+|-----|-------------|----------------------|
+| `W` / `S` | Move up / down (`Shift` jumps between houses) | Pick an email |
+| `A` / `D` | Move the email toward important / toward junk | Pick a tile |
+| `1` `2` `3` | Put it straight into important / neutral / junk | |
+| `Space` | Toggle read | Revert the selected change (again to restore) |
+| `E` | Review the batch (`Shift+E` opens the email in Gmail) | Apply (`Shift+E` applies without creating filters) |
+| `Q` | Undo the last applied batch (`Shift+Q` quits) | Back to the list |
+
+Nothing touches Gmail until you press `E` on the review screen. It shows every change as a tile (stars, reads, spam, new filters, your corrections), and you can revert any single change from there.
+
+![Review screen](docs/screenshots/after-3-review.png)
+
+`Q` undoes the last applied batch: stars, read state and spam moves are reversed, and any filter that batch created is deleted. The session ends with a summary of everything that changed.
 
 ### Learning
 
-The hat remembers. Every time you move a sender to neutral or spam, it's tracked in `learning.json`. After 3 occurrences from the same sender, a Gmail filter is created automatically so future emails are handled without you lifting a finger.
+The hat remembers. Each correction and each sender you mark read or send to spam is tracked in `learning.json`, and the list shows how close a sender is (`2/3 auto-read`). The third time, the review screen shows the Gmail filter it's about to create, and you can skip it. Job senders and job boards are never filtered.
+
+### Tests
+
+```bash
+npm test
+```
 
 ---
 
